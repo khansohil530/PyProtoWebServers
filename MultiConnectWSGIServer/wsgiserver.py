@@ -1,15 +1,37 @@
-import io
+import errno
+import os
+import signal
 import socket
+import io
 import sys
+
+
+def grim_reaper(signum, frame):
+    while True:
+        try:
+            pid, status = os.waitpid(
+                -1,         
+                 os.WNOHANG
+            )
+            print(
+                'Child {pid} terminated with status {status}'
+                '\n'.format(pid=pid, status=status)
+            )
+        except OSError:
+            return
+
+        if pid == 0:  # no more zombies
+            return
 
 
 class WSGIServer(object):
 
     address_family = socket.AF_INET
     socket_type = socket.SOCK_STREAM
-    request_queue_size = 1
+    request_queue_size = 1024
 
     def __init__(self, server_address):
+        # Create a listening socket
         self.listen_socket = listen_socket = socket.socket(
             self.address_family,
             self.socket_type
@@ -28,14 +50,29 @@ class WSGIServer(object):
     def serve_forever(self):
         listen_socket = self.listen_socket
         while True:
-            self.client_connection, client_address = listen_socket.accept()
-            self.handle_one_request()
+            try:
+                self.client_connection, client_address = listen_socket.accept()
+            except IOError as e:
+                code, msg = e.args
+                if code == errno.EINTR:
+                    continue
+                else:
+                    raise
+
+            pid = os.fork()
+            if pid == 0: # child
+                listen_socket.close()
+                self.handle_one_request()
+                os._exit(0)
+            else: # parent
+                self.client_connection.close()
 
     def handle_one_request(self):
         request_data = self.client_connection.recv(1024)
         self.request_data = request_data = request_data.decode('utf-8')
         print(''.join(
-            f'< {line}\n' for line in request_data.splitlines()
+            '< {line}\n'.format(line=line)
+            for line in request_data.splitlines()
         ))
 
         self.parse_request(request_data)
@@ -63,6 +100,7 @@ class WSGIServer(object):
         env['wsgi.multithread']  = False
         env['wsgi.multiprocess'] = False
         env['wsgi.run_once']     = False
+
         env['REQUEST_METHOD']    = self.request_method    # GET
         env['PATH_INFO']         = self.path              # /hello
         env['SERVER_NAME']       = self.server_name       # localhost
@@ -75,18 +113,19 @@ class WSGIServer(object):
             ('Server', 'WSGIServer 0.2'),
         ]
         self.headers_set = [status, response_headers + server_headers]
-        
+
     def finish_response(self, result):
         try:
             status, response_headers = self.headers_set
-            response = f'HTTP/1.1 {status}\r\n'
+            response = 'HTTP/1.1 {status}\r\n'.format(status=status)
             for header in response_headers:
                 response += '{0}: {1}\r\n'.format(*header)
             response += '\r\n'
             for data in result:
                 response += data.decode('utf-8')
             print(''.join(
-                f'> {line}\n' for line in response.splitlines()
+                '> {line}\n'.format(line=line)
+                for line in response.splitlines()
             ))
             response_bytes = response.encode()
             self.client_connection.sendall(response_bytes)
@@ -98,6 +137,7 @@ SERVER_ADDRESS = (HOST, PORT) = '', 8888
 
 
 def make_server(server_address, application):
+    signal.signal(signal.SIGCHLD, grim_reaper)
     server = WSGIServer(server_address)
     server.set_app(application)
     return server
@@ -111,5 +151,5 @@ if __name__ == '__main__':
     module = __import__(module)
     application = getattr(module, application)
     httpd = make_server(SERVER_ADDRESS, application)
-    print(f'WSGIServer: Serving HTTP on port {PORT} ...\n')
+    print('WSGIServer: Serving HTTP on port {port} ...\n'.format(port=PORT))
     httpd.serve_forever()
